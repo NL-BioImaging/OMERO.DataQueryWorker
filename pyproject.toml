@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omero-data-query-worker"
+version = "0.1.0"
+description = "A hardened, OMERO-agnostic service for bounded queries over DuckDB, SQLite, and CSV sources"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "AGPL-3.0-or-later"
+authors = [{ name = "NL-BioImaging" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+  "duckdb>=1.4.0,<2",
+  "fastapi>=0.116,<1",
+  "python-multipart>=0.0.20,<1",
+  "sqlglot>=27,<29",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+test = [
+  "httpx>=0.28,<1",
+  "mypy>=1.17,<2",
+  "pytest>=8.4,<10",
+  "pytest-cov>=6.2,<8",
+  "ruff>=0.12,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/NL-BioImaging/OMERO.DataQueryWorker"
+Repository = "https://github.com/NL-BioImaging/OMERO.DataQueryWorker"
+Issues = "https://github.com/NL-BioImaging/OMERO.DataQueryWorker/issues"
+
+[project.scripts]
+omero-data-query-worker = "omero_data_query_worker.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["omero_data_query_worker"]

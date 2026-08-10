@@ -1,0 +1,82 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+GIB = 1024**3
+MIB = 1024**2
+
+
+def _positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be positive")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class Settings:
+    api_token: str
+    cache_dir: Path = Path("/var/lib/omero-data-query-worker")
+    source_cache_max_bytes: int = 100 * GIB
+    result_cache_max_bytes: int = 10 * GIB
+    source_ttl_seconds: int = 7 * 24 * 60 * 60
+    result_ttl_seconds: int = 24 * 60 * 60
+    max_source_bytes: int = 20 * GIB
+    query_timeout_seconds: int = 30
+    ingestion_timeout_seconds: int = 10 * 60
+    max_result_rows: int = 100_000
+    max_result_bytes: int = 64 * MIB
+    max_concurrent_queries: int = 4
+    duckdb_memory_limit: str = "1GB"
+    duckdb_threads: int = 2
+
+    @classmethod
+    def from_env(cls) -> Settings:
+        token = os.getenv("DQW_API_TOKEN", "")
+        return cls(
+            api_token=token,
+            cache_dir=Path(os.getenv("DQW_CACHE_DIR", "/var/lib/omero-data-query-worker")),
+            source_cache_max_bytes=_positive_int("DQW_SOURCE_CACHE_MAX_BYTES", 100 * GIB),
+            result_cache_max_bytes=_positive_int("DQW_RESULT_CACHE_MAX_BYTES", 10 * GIB),
+            source_ttl_seconds=_positive_int("DQW_SOURCE_TTL_SECONDS", 7 * 24 * 60 * 60),
+            result_ttl_seconds=_positive_int("DQW_RESULT_TTL_SECONDS", 24 * 60 * 60),
+            max_source_bytes=_positive_int("DQW_MAX_SOURCE_BYTES", 20 * GIB),
+            query_timeout_seconds=_positive_int("DQW_QUERY_TIMEOUT_SECONDS", 30),
+            ingestion_timeout_seconds=_positive_int("DQW_INGESTION_TIMEOUT_SECONDS", 10 * 60),
+            max_result_rows=_positive_int("DQW_MAX_RESULT_ROWS", 100_000),
+            max_result_bytes=_positive_int("DQW_MAX_RESULT_BYTES", 64 * MIB),
+            max_concurrent_queries=_positive_int("DQW_MAX_CONCURRENT_QUERIES", 4),
+            duckdb_memory_limit=os.getenv("DQW_DUCKDB_MEMORY_LIMIT", "1GB"),
+            duckdb_threads=_positive_int("DQW_DUCKDB_THREADS", 2),
+        )
+
+    def prepare(self) -> None:
+        if not self.api_token:
+            raise RuntimeError("DQW_API_TOKEN is required")
+        if len(self.api_token) < 16:
+            raise RuntimeError("DQW_API_TOKEN must contain at least 16 characters")
+        for path in (self.cache_dir, self.sources_dir, self.results_dir, self.tmp_dir):
+            path.mkdir(parents=True, exist_ok=True)
+        probe = self.cache_dir / ".write-test"
+        probe.write_bytes(b"ready")
+        probe.unlink()
+
+    @property
+    def sources_dir(self) -> Path:
+        return self.cache_dir / "sources"
+
+    @property
+    def results_dir(self) -> Path:
+        return self.cache_dir / "results"
+
+    @property
+    def tmp_dir(self) -> Path:
+        return self.cache_dir / "tmp"

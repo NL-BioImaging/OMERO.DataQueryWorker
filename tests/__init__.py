@@ -1,0 +1,1 @@
+"""OMERO.DataQueryWorker tests."""
