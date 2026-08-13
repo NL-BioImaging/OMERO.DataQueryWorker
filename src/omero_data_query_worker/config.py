@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -65,6 +66,13 @@ class Settings:
             raise RuntimeError("DQW_API_TOKEN must contain at least 16 characters")
         for path in (self.cache_dir, self.sources_dir, self.results_dir, self.tmp_dir):
             path.mkdir(parents=True, exist_ok=True)
+        # Starlette's multipart parser uses tempfile.SpooledTemporaryFile before
+        # the request reaches the ingestion service. Default that spool to the
+        # cache volume so multi-gigabyte sources are not limited by a small,
+        # hardened /tmp tmpfs. An explicit TMPDIR remains supported.
+        multipart_tmp_dir = Path(os.getenv("TMPDIR", str(self.tmp_dir)))
+        multipart_tmp_dir.mkdir(parents=True, exist_ok=True)
+        tempfile.tempdir = str(multipart_tmp_dir)
         probe = self.cache_dir / ".write-test"
         probe.write_bytes(b"ready")
         probe.unlink()

@@ -3,7 +3,8 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    DQW_CACHE_DIR=/var/lib/omero-data-query-worker
+    DQW_CACHE_DIR=/var/lib/omero-data-query-worker \
+    TMPDIR=/var/lib/omero-data-query-worker/tmp
 
 RUN groupadd --gid 10001 dataquery \
     && useradd --uid 10001 --gid dataquery --no-create-home --shell /usr/sbin/nologin dataquery \

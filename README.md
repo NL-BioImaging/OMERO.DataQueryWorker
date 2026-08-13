@@ -58,6 +58,7 @@ volatile time, random, sequence, or UUID functions bypass the result cache.
 | --- | --- |
 | `DQW_API_TOKEN` | required, at least 16 characters |
 | `DQW_CACHE_DIR` | `/var/lib/omero-data-query-worker` |
+| `TMPDIR` | `/var/lib/omero-data-query-worker/tmp` in the container |
 | `DQW_SOURCE_CACHE_MAX_BYTES` | 100 GiB |
 | `DQW_RESULT_CACHE_MAX_BYTES` | 10 GiB |
 | `DQW_SOURCE_TTL_SECONDS` | 7 days |
@@ -72,6 +73,9 @@ volatile time, random, sequence, or UUID functions bypass the result cache.
 
 The cache volume contains source data and query results in plaintext and must
 be treated as trusted server storage. Run one worker replica per cache volume.
+Container deployments should keep `TMPDIR` under that writable volume. The
+multipart parser spools large streamed uploads there before atomic ingestion;
+the separate `/tmp` tmpfs can therefore remain small and constrained.
 
 ## Verification
 
@@ -90,4 +94,3 @@ confirms that its cache survives.
 
 Copyright NL-BioImaging contributors. Licensed under
 AGPL-3.0-or-later.
-

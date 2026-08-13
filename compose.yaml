@@ -6,6 +6,7 @@ services:
     environment:
       DQW_API_TOKEN: smoke-test-token-at-least-16-characters
       DQW_CACHE_DIR: /var/lib/omero-data-query-worker
+      TMPDIR: /var/lib/omero-data-query-worker/tmp
       DQW_DUCKDB_MEMORY_LIMIT: 512MB
       DQW_DUCKDB_THREADS: "2"
       DQW_MAX_CONCURRENT_QUERIES: "4"
