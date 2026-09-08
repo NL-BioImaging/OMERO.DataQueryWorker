@@ -17,7 +17,7 @@ from fastapi import UploadFile
 from pydantic import ValidationError
 
 from . import __version__
-from .cache import CacheManager, ResultRecord, SourceRecord, iso, utc_now
+from .cache import CacheManager, ResultRecord, SourceRecord, iso, sync_directory, utc_now
 from .config import Settings
 from .engines import engine_versions, validate_filename
 from .errors import (
@@ -63,7 +63,15 @@ class QueryService:
         self._locks_guard = threading.Lock()
 
     def prepare(self) -> None:
+        missing = []
+        parent = self.settings.cache_dir
+        while not parent.exists():
+            missing.append(parent)
+            parent = parent.parent
         self.settings.prepare()
+        for created in reversed(missing):
+            sync_directory(created.parent)
+        sync_directory(self.settings.cache_dir)
         from .operations import recovery_lock
 
         with recovery_lock(self.settings.cache_dir):
