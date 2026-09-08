@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 GIB = 1024**3
@@ -38,6 +38,9 @@ class Settings:
     max_concurrent_queries: int = 4
     duckdb_memory_limit: str = "1GB"
     duckdb_threads: int = 2
+    token_keyring_file: str = ""
+    max_concurrent_ingestions: int = 1
+    cleanup_interval_seconds: int = 60
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -57,12 +60,15 @@ class Settings:
             max_concurrent_queries=_positive_int("DQW_MAX_CONCURRENT_QUERIES", 4),
             duckdb_memory_limit=os.getenv("DQW_DUCKDB_MEMORY_LIMIT", "1GB"),
             duckdb_threads=_positive_int("DQW_DUCKDB_THREADS", 2),
+            token_keyring_file=os.getenv("DQW_TOKEN_KEYRING_FILE", ""),
+            max_concurrent_ingestions=_positive_int("DQW_MAX_CONCURRENT_INGESTIONS", 1),
+            cleanup_interval_seconds=_positive_int("DQW_CLEANUP_INTERVAL_SECONDS", 60),
         )
 
     def prepare(self) -> None:
-        if not self.api_token:
+        if not self.api_token and not self.token_keyring_file:
             raise RuntimeError("DQW_API_TOKEN is required")
-        if len(self.api_token) < 16:
+        if self.api_token and len(self.api_token) < 16:
             raise RuntimeError("DQW_API_TOKEN must contain at least 16 characters")
         for path in (self.cache_dir, self.sources_dir, self.results_dir, self.tmp_dir):
             path.mkdir(parents=True, exist_ok=True)
@@ -76,6 +82,10 @@ class Settings:
         probe = self.cache_dir / ".write-test"
         probe.write_bytes(b"ready")
         probe.unlink()
+
+    def execution_settings(self) -> Settings:
+        """Never serialize service credentials into an engine process."""
+        return replace(self, api_token="", token_keyring_file="")
 
     @property
     def sources_dir(self) -> Path:

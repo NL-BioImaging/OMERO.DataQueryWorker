@@ -9,13 +9,20 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .config import Settings
-from .errors import ResultNotFound, SourceNotFound
+from .errors import (
+    CacheCapacityExceeded,
+    InvalidQuery,
+    QueryCapacityExceeded,
+    ResultNotFound,
+    SourceNotFound,
+)
 from .models import SourceFormat
 
 SOURCE_ID_PATTERN = re.compile(r"^src_[a-f0-9]{64}$")
@@ -45,6 +52,29 @@ def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+    sync_directory(path.parent)
+
+
+def sync_directory(path: Path) -> None:
+    if os.name == "posix":
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def file_digest(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def sync_tree(path: Path) -> None:
+    for item in path.iterdir():
+        if item.is_file():
+            with item.open("r+b") as handle:
+                os.fsync(handle.fileno())
+    sync_directory(path)
 
 
 @dataclass(slots=True)
@@ -62,6 +92,7 @@ class SourceRecord:
     created_at: str
     accessed_at: str
     expires_at: str
+    data_sha256: str | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> SourceRecord:
@@ -79,6 +110,7 @@ class SourceRecord:
             created_at=str(value["created_at"]),
             accessed_at=str(value["accessed_at"]),
             expires_at=str(value["expires_at"]),
+            data_sha256=value.get("data_sha256"),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -96,6 +128,7 @@ class SourceRecord:
             "created_at": self.created_at,
             "accessed_at": self.accessed_at,
             "expires_at": self.expires_at,
+            "data_sha256": self.data_sha256,
         }
 
 
@@ -115,6 +148,7 @@ class ResultRecord:
     created_at: str
     accessed_at: str
     expires_at: str
+    execution: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> ResultRecord:
@@ -133,6 +167,7 @@ class ResultRecord:
             created_at=str(value["created_at"]),
             accessed_at=str(value["accessed_at"]),
             expires_at=str(value["expires_at"]),
+            execution=value.get("execution"),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -151,6 +186,7 @@ class ResultRecord:
             "created_at": self.created_at,
             "accessed_at": self.accessed_at,
             "expires_at": self.expires_at,
+            "execution": self.execution,
         }
 
 
@@ -163,6 +199,60 @@ class CacheManager:
         self.bypasses = 0
         self.evictions = 0
         self.active_queries = 0
+        self._leases: dict[str, int] = {}
+        self._staging: dict[Path, tuple[str, int]] = {}
+
+    @contextmanager
+    def lease_source(self, source_id: str) -> Iterator[SourceRecord]:
+        with self._lock:
+            record = self.get_source(source_id)
+            self._leases[source_id] = self._leases.get(source_id, 0) + 1
+        try:
+            yield record
+        finally:
+            self.release(source_id)
+
+    def acquire_result(self, result_id: str) -> ResultRecord:
+        with self._lock:
+            record = self.get_result(result_id)
+            self._leases[result_id] = self._leases.get(result_id, 0) + 1
+            return record
+
+    def release(self, identifier: str) -> None:
+        with self._lock:
+            count = self._leases.get(identifier, 0)
+            if count <= 1:
+                self._leases.pop(identifier, None)
+            else:
+                self._leases[identifier] = count - 1
+
+    def reserve(self, staging: Path, size: int) -> None:
+        """Account for concurrent staging bytes as well as committed cache entries."""
+        with self._lock:
+            kind, old_size = self._staging[staging]
+            root = self.settings.sources_dir if kind == "source" else self.settings.results_dir
+            maximum = (
+                self.settings.source_cache_max_bytes
+                if kind == "source"
+                else self.settings.result_cache_max_bytes
+            )
+            others = sum(n for p, (k, n) in self._staging.items() if p != staging and k == kind)
+            if size + others > maximum:
+                raise CacheCapacityExceeded("Staged data exceeds the cache capacity")
+            if max(0, size - old_size) > shutil.disk_usage(self.settings.cache_dir).free:
+                raise CacheCapacityExceeded("Insufficient free space on the cache volume")
+            self._cleanup(root, maximum - size - others, set())
+            if directory_bytes(root) + size + others > maximum:
+                raise CacheCapacityExceeded("Cache capacity is occupied by active work")
+            self._staging[staging] = kind, size
+
+    def observe_staging(self, staging: Path) -> None:
+        self.reserve(staging, directory_bytes(staging))
+
+    def discard_staging(self, staging: Path) -> None:
+        with self._lock:
+            self._staging.pop(staging, None)
+            self._remove_directory(staging, self.settings.tmp_dir, count=False)
 
     @staticmethod
     def source_id(scope_id: str, source_ref: str) -> str:
@@ -176,9 +266,11 @@ class CacheManager:
         return self.settings.results_dir / result_id
 
     def staging_path(self, prefix: str) -> Path:
-        path = self.settings.tmp_dir / f"{prefix}-{uuid.uuid4().hex}"
-        path.mkdir(parents=True)
-        return path
+        with self._lock:
+            path = self.settings.tmp_dir / f"{prefix}-{uuid.uuid4().hex}"
+            path.mkdir(parents=True)
+            self._staging[path] = prefix, 0
+            return path
 
     def _read_manifest(self, path: Path) -> dict[str, Any]:
         try:
@@ -198,7 +290,11 @@ class CacheManager:
                 record = SourceRecord.from_dict(self._read_manifest(path / "manifest.json"))
             except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
                 raise SourceNotFound("The source is not cached") from exc
-            if parse_iso(record.expires_at) <= utc_now() or not (path / record.data_file).is_file():
+            if (
+                (parse_iso(record.expires_at) <= utc_now() and not self._leases.get(source_id))
+                or Path(record.data_file).name != record.data_file
+                or not (path / record.data_file).is_file()
+            ):
                 self._remove_directory(path, self.settings.sources_dir)
                 raise SourceNotFound("The source has expired or is incomplete")
             if touch:
@@ -229,21 +325,35 @@ class CacheManager:
     def commit_source(self, staging: Path, record: SourceRecord) -> SourceRecord:
         target = self.source_path(record.source_id)
         with self._lock:
+            record.data_sha256 = file_digest(staging / record.data_file)
             _write_json_atomic(staging / "manifest.json", record.as_dict())
             if target.exists():
-                self._remove_directory(staging, self.settings.tmp_dir, count=False)
+                self.discard_staging(staging)
                 return self.get_source(record.source_id)
+            self.observe_staging(staging)
+            sync_tree(staging)
             os.replace(staging, target)
+            sync_directory(target.parent)
+            sync_directory(staging.parent)
+            self._staging.pop(staging, None)
             self.cleanup_sources(protected={record.source_id})
             return record
 
-    def get_result_by_query_key(self, query_key: str) -> ResultRecord | None:
+    def get_result_by_query_key(
+        self, query_key: str, *, require_provenance: bool = False
+    ) -> ResultRecord | None:
         result_id = f"res_{query_key}"
         try:
             record = self.get_result(result_id)
         except ResultNotFound:
             return None
         if record.query_key != query_key:
+            return None
+        if require_provenance and not record.execution:
+            with self._lock:
+                if self._leases.get(result_id):
+                    raise QueryCapacityExceeded("Legacy result is being downloaded; retry later")
+                self._remove_directory(self.result_path(result_id), self.settings.results_dir)
             return None
         return record
 
@@ -257,7 +367,8 @@ class CacheManager:
             except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
                 raise ResultNotFound("The result is not cached") from exc
             if (
-                parse_iso(record.expires_at) <= utc_now()
+                (parse_iso(record.expires_at) <= utc_now() and not self._leases.get(result_id))
+                or Path(record.result_file).name != record.result_file
                 or not (path / record.result_file).is_file()
             ):
                 self._remove_directory(path, self.settings.results_dir)
@@ -274,9 +385,14 @@ class CacheManager:
         with self._lock:
             _write_json_atomic(staging / "manifest.json", record.as_dict())
             if target.exists():
-                self._remove_directory(staging, self.settings.tmp_dir, count=False)
+                self.discard_staging(staging)
                 return self.get_result(record.result_id)
+            self.observe_staging(staging)
+            sync_tree(staging)
             os.replace(staging, target)
+            sync_directory(target.parent)
+            sync_directory(staging.parent)
+            self._staging.pop(staging, None)
             self.cleanup_results(protected={record.result_id})
             return record
 
@@ -289,7 +405,7 @@ class CacheManager:
             try:
                 yield path, self._read_manifest(path / "manifest.json")
             except FileNotFoundError:
-                self._remove_directory(path, root)
+                yield path, {}
 
     def _cleanup(
         self,
@@ -298,6 +414,7 @@ class CacheManager:
         protected: set[str],
     ) -> None:
         with self._lock:
+            protected = protected | set(self._leases)
             now = utc_now()
             entries: list[tuple[datetime, Path, int]] = []
             total = 0
@@ -336,7 +453,41 @@ class CacheManager:
             protected or set(),
         )
 
-    def cleanup_temporary(self) -> None:
+    def recover(self) -> None:
+        """Called under exclusive service/engine locks before accepting requests."""
+        self.cleanup_temporary(startup=True)
+        for root, kind in (
+            (self.settings.sources_dir, "source"),
+            (self.settings.results_dir, "result"),
+        ):
+            for path, value in self._manifest_directories(root):
+                try:
+                    if kind == "source":
+                        source = SourceRecord.from_dict(value)
+                        filename = source.data_file
+                        expected = source.data_sha256 or (
+                            source.sha256 if source.format is not SourceFormat.csv else None
+                        )
+                        identifier = source.source_id
+                    else:
+                        result = ResultRecord.from_dict(value)
+                        filename = result.result_file
+                        expected = (result.execution or {}).get("result_sha256")
+                        identifier = result.result_id
+                        if (path / filename).stat().st_size != result.byte_count:
+                            raise ValueError("Result length disagrees with its manifest")
+                    if (
+                        identifier != path.name
+                        or Path(filename).name != filename
+                        or not expected
+                        or (path / filename).is_symlink()
+                        or file_digest(path / filename) != expected
+                    ):
+                        raise ValueError("Incomplete cache publication")
+                except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                    self._remove_directory(path, root)
+
+    def cleanup_temporary(self, *, startup: bool = False) -> None:
         cutoff = (
             time.time()
             - max(
@@ -347,12 +498,18 @@ class CacheManager:
         )
         for path in self.settings.tmp_dir.iterdir():
             try:
-                if path.is_dir() and path.stat().st_mtime < cutoff:
+                if (
+                    path not in self._staging
+                    and path.is_dir()
+                    and (startup or path.stat().st_mtime < cutoff)
+                ):
                     self._remove_directory(path, self.settings.tmp_dir, count=False)
             except FileNotFoundError:
                 continue
 
     def _remove_directory(self, path: Path, root: Path, *, count: bool = True) -> None:
+        if self._leases.get(path.name):
+            return
         root_resolved = root.resolve()
         path_resolved = path.resolve()
         if path_resolved.parent != root_resolved:
@@ -361,6 +518,51 @@ class CacheManager:
             shutil.rmtree(path_resolved)
             if count:
                 self.evictions += 1
+
+    def purge(
+        self,
+        *,
+        source_id: str | None = None,
+        scope_id: str | None = None,
+        result_id: str | None = None,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        if sum(value is not None for value in (source_id, scope_id, result_id)) != 1:
+            raise InvalidQuery("Select exactly one source_id, scope_id, or result_id")
+        with self._lock:
+            sources = list(self._manifest_directories(self.settings.sources_dir))
+            selected_sources = {
+                p.name
+                for p, m in sources
+                if p.name == source_id or (scope_id and m.get("scope_id") == scope_id)
+            }
+            entries = [
+                (p, self.settings.sources_dir) for p, _ in sources if p.name in selected_sources
+            ]
+            entries.extend(
+                (p, self.settings.results_dir)
+                for p, m in self._manifest_directories(self.settings.results_dir)
+                if p.name == result_id or m.get("source_id") in selected_sources
+            )
+            busy = {p.name for p, _ in entries if self._leases.get(p.name)}
+            # Do not partially purge a source while it is producing a new result.
+            if busy:
+                return {
+                    "dry_run": dry_run,
+                    "selected": [p.name for p, _ in entries],
+                    "removed": [],
+                    "busy": sorted(busy),
+                }
+            selected = [p.name for p, _ in entries]
+            if not dry_run:
+                for p, root in entries:
+                    self._remove_directory(p, root)
+            return {
+                "dry_run": dry_run,
+                "selected": selected,
+                "removed": [] if dry_run else selected,
+                "busy": [],
+            }
 
     def status(self) -> dict[str, int]:
         with self._lock:
@@ -377,3 +579,18 @@ class CacheManager:
                 "evictions": self.evictions,
                 "active_queries": self.active_queries,
             }
+
+    def has_capacity(self) -> bool:
+        """Readiness requires headroom after eviction of inactive entries."""
+        with self._lock:
+            for kind, root, maximum in (
+                ("source", self.settings.sources_dir, self.settings.source_cache_max_bytes),
+                ("result", self.settings.results_dir, self.settings.result_cache_max_bytes),
+            ):
+                pinned = sum(
+                    directory_bytes(root / key) for key in self._leases if (root / key).is_dir()
+                )
+                staged = sum(size for k, size in self._staging.values() if k == kind)
+                if pinned + staged >= maximum:
+                    return False
+            return True

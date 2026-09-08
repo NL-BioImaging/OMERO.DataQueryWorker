@@ -102,6 +102,15 @@ class QueryResponse(BaseModel):
     sql_sha256: str
     duration_ms: int
     cache_status: Literal["hit", "miss", "bypass"]
+    execution: dict[str, Any] | None = None
+
+
+class PurgeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_id: str | None = None
+    scope_id: str | None = Field(default=None, pattern=OPAQUE_PATTERN)
+    result_id: str | None = None
+    dry_run: bool = True
 
 
 class ErrorResponse(BaseModel):

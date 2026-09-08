@@ -1,0 +1,7 @@
+**
+!deploy
+!deploy/Dockerfile.tests
+!tests
+!tests/**
+!scripts
+!scripts/security_inside.py

@@ -1,5 +1,6 @@
 services:
   data-query-worker:
+    init: true
     build:
       context: .
     image: omero-data-query-worker:smoke

@@ -9,6 +9,7 @@ import sqlite3
 from collections.abc import Iterable
 from datetime import date, datetime, time
 from decimal import Decimal
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,31 @@ from .models import SourceFormat
 DUCKDB_EXTENSION = ".duckdb"
 SQLITE_EXTENSIONS = {".sqlite", ".sqlite3"}
 CSV_EXTENSION = ".csv"
+
+
+def engine_versions() -> dict[str, str]:
+    return {
+        "duckdb": duckdb.__version__,
+        "sqlite": sqlite3.sqlite_version,
+        "sqlglot": version("sqlglot"),
+    }
+
+
+class BoundedCSVOutput:
+    def __init__(self, handle: Any, maximum: int):
+        self.handle = handle
+        self.maximum = maximum
+        self.size = 0
+        self.digest = hashlib.sha256()
+
+    def write(self, text: str) -> int:
+        content = text.encode("utf-8")
+        if self.size + len(content) > self.maximum:
+            raise QueryLimitExceeded(f"Query exceeds the {self.maximum} byte limit")
+        self.handle.write(content)
+        self.digest.update(content)
+        self.size += len(content)
+        return len(text)
 
 
 def safe_filename(filename: str) -> str:
@@ -275,8 +301,9 @@ def _write_result(
     ]
     preview: list[list[Any]] = []
     row_count = 0
-    with output_path.open("w", encoding="utf-8", newline="") as text_handle:
-        writer = csv.writer(text_handle, lineterminator="\n")
+    with output_path.open("wb") as text_handle:
+        bounded = BoundedCSVOutput(text_handle, max_bytes)
+        writer = csv.writer(bounded, lineterminator="\n")
         writer.writerow([column["name"] for column in columns])
         while True:
             rows: Iterable[tuple[Any, ...]] = cursor.fetchmany(1000)
@@ -295,8 +322,6 @@ def _write_result(
                     preview.append([_json_value(value) for value in row])
                 writer.writerow([_csv_value(value) for value in row])
             text_handle.flush()
-            if os.fstat(text_handle.fileno()).st_size > max_bytes:
-                raise QueryLimitExceeded(f"Query exceeds the {max_bytes} byte limit")
         text_handle.flush()
         os.fsync(text_handle.fileno())
         byte_count = os.fstat(text_handle.fileno()).st_size
@@ -305,6 +330,7 @@ def _write_result(
         "row_count": row_count,
         "byte_count": byte_count,
         "preview": preview,
+        "result_sha256": bounded.digest.hexdigest(),
     }
 
 
@@ -316,7 +342,14 @@ def execute_duckdb_query(
     settings: Settings,
 ) -> dict[str, Any]:
     try:
-        connection = duckdb.connect(str(source_path), read_only=True)
+        # DuckDB's default spill path is derived from the shared source filename.
+        # Independent read-only processes must never share spill files. Keeping
+        # spill inside this query's staging directory also makes it quota-accounted.
+        connection = duckdb.connect(
+            str(source_path),
+            read_only=True,
+            config={"temp_directory": str(output_path.parent / "duckdb-spill")},
+        )
         configure_duckdb(connection, settings)
         cursor = connection.execute(sql, parameters)
         return _write_result(
