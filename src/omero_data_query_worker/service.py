@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import UploadFile
+from pydantic import ValidationError
 
 from . import __version__
 from .cache import CacheManager, ResultRecord, SourceRecord, iso, utc_now
@@ -63,7 +64,10 @@ class QueryService:
 
     def prepare(self) -> None:
         self.settings.prepare()
-        self.cache.cleanup_temporary()
+        from .operations import recovery_lock
+
+        with recovery_lock(self.settings.cache_dir):
+            self.cache.recover()
         self.cache.cleanup_sources()
         self.cache.cleanup_results()
 
@@ -137,13 +141,16 @@ class QueryService:
         upload: UploadFile,
         cancelled: threading.Event | None = None,
     ) -> SourceSummary:
-        source_request = SourceResolveRequest(
-            scope_id=scope_id,
-            source_ref=source_ref,
-            format=source_format,
-            size=declared_size,
-            expected_sha256=expected_sha256,
-        )
+        try:
+            source_request = SourceResolveRequest(
+                scope_id=scope_id,
+                source_ref=source_ref,
+                format=source_format,
+                size=declared_size,
+                expected_sha256=expected_sha256,
+            )
+        except ValidationError as exc:
+            raise InvalidSource("Invalid source reference, size, or checksum metadata") from exc
         filename = validate_filename(upload.filename or "", source_format)
         source_id = self.cache.source_id(scope_id, source_ref)
         lock = self._named_lock(self._source_locks, source_id)

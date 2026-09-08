@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 
 from sqlglot import exp, parse
-from sqlglot.errors import ParseError
+from sqlglot.errors import ParseError, TokenError
 
 from .errors import InvalidQuery
 from .models import SourceFormat
@@ -105,7 +105,7 @@ def validate_query(
         raise InvalidQuery("SQL must not contain NUL bytes")
     try:
         statements = parse(sql, read=_dialect(source_format))
-    except ParseError as exc:
+    except (ParseError, TokenError) as exc:
         raise InvalidQuery(f"SQL could not be parsed: {exc}") from exc
     if len(statements) != 1 or statements[0] is None:
         raise InvalidQuery("Exactly one SQL statement is required")

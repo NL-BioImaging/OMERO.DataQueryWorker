@@ -14,7 +14,7 @@ from .config import Settings
 from .engines import execute_duckdb_query, execute_sqlite_query
 from .errors import QueryExecutionError, QueryLimitExceeded, QueryTimedOut, WorkerError
 from .models import SourceFormat
-from .operations import sanitize_execution_environment
+from .operations import execution_guard, sanitize_execution_environment
 
 
 def apply_process_limits(settings: Settings, timeout_seconds: int) -> None:
@@ -36,8 +36,11 @@ def _child_execute(
     parameters: dict[str, Any],
     output_path: str,
     settings: Settings,
+    parent_pid: int,
 ) -> None:
+    guard = None
     try:
+        guard = execution_guard(parent_pid, settings.cache_dir)
         sanitize_execution_environment()
         apply_process_limits(settings, settings.query_timeout_seconds)
         started = time.monotonic()
@@ -57,6 +60,8 @@ def _child_execute(
         child.send({"ok": False, "code": "query_execution_failed", "message": str(exc)})
     finally:
         child.close()
+        if guard:
+            guard.close()
 
 
 def execute_in_subprocess(
@@ -81,6 +86,7 @@ def execute_in_subprocess(
             parameters,
             str(output_path),
             settings.execution_settings(),
+            os.getpid(),
         ),
         daemon=True,
     )

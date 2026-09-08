@@ -33,6 +33,7 @@ def test_accepts_select_with_named_parameters() -> None:
         "SELECT getenv('DQW_API_TOKEN')",
         "SELECT * FROM sqlite_scan('x.sqlite', 'data')",
         "SELECT 1; SELECT 2",
+        "SELECT 'unterminated",
     ],
 )
 def test_rejects_unsafe_sql(sql: str) -> None:

@@ -52,6 +52,29 @@ def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+    sync_directory(path.parent)
+
+
+def sync_directory(path: Path) -> None:
+    if os.name == "posix":
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def file_digest(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def sync_tree(path: Path) -> None:
+    for item in path.iterdir():
+        if item.is_file():
+            with item.open("r+b") as handle:
+                os.fsync(handle.fileno())
+    sync_directory(path)
 
 
 @dataclass(slots=True)
@@ -69,6 +92,7 @@ class SourceRecord:
     created_at: str
     accessed_at: str
     expires_at: str
+    data_sha256: str | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> SourceRecord:
@@ -86,6 +110,7 @@ class SourceRecord:
             created_at=str(value["created_at"]),
             accessed_at=str(value["accessed_at"]),
             expires_at=str(value["expires_at"]),
+            data_sha256=value.get("data_sha256"),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -103,6 +128,7 @@ class SourceRecord:
             "created_at": self.created_at,
             "accessed_at": self.accessed_at,
             "expires_at": self.expires_at,
+            "data_sha256": self.data_sha256,
         }
 
 
@@ -299,12 +325,16 @@ class CacheManager:
     def commit_source(self, staging: Path, record: SourceRecord) -> SourceRecord:
         target = self.source_path(record.source_id)
         with self._lock:
+            record.data_sha256 = file_digest(staging / record.data_file)
             _write_json_atomic(staging / "manifest.json", record.as_dict())
             if target.exists():
                 self.discard_staging(staging)
                 return self.get_source(record.source_id)
             self.observe_staging(staging)
+            sync_tree(staging)
             os.replace(staging, target)
+            sync_directory(target.parent)
+            sync_directory(staging.parent)
             self._staging.pop(staging, None)
             self.cleanup_sources(protected={record.source_id})
             return record
@@ -358,7 +388,10 @@ class CacheManager:
                 self.discard_staging(staging)
                 return self.get_result(record.result_id)
             self.observe_staging(staging)
+            sync_tree(staging)
             os.replace(staging, target)
+            sync_directory(target.parent)
+            sync_directory(staging.parent)
             self._staging.pop(staging, None)
             self.cleanup_results(protected={record.result_id})
             return record
@@ -420,7 +453,41 @@ class CacheManager:
             protected or set(),
         )
 
-    def cleanup_temporary(self) -> None:
+    def recover(self) -> None:
+        """Called under exclusive service/engine locks before accepting requests."""
+        self.cleanup_temporary(startup=True)
+        for root, kind in (
+            (self.settings.sources_dir, "source"),
+            (self.settings.results_dir, "result"),
+        ):
+            for path, value in self._manifest_directories(root):
+                try:
+                    if kind == "source":
+                        source = SourceRecord.from_dict(value)
+                        filename = source.data_file
+                        expected = source.data_sha256 or (
+                            source.sha256 if source.format is not SourceFormat.csv else None
+                        )
+                        identifier = source.source_id
+                    else:
+                        result = ResultRecord.from_dict(value)
+                        filename = result.result_file
+                        expected = (result.execution or {}).get("result_sha256")
+                        identifier = result.result_id
+                        if (path / filename).stat().st_size != result.byte_count:
+                            raise ValueError("Result length disagrees with its manifest")
+                    if (
+                        identifier != path.name
+                        or Path(filename).name != filename
+                        or not expected
+                        or (path / filename).is_symlink()
+                        or file_digest(path / filename) != expected
+                    ):
+                        raise ValueError("Incomplete cache publication")
+                except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                    self._remove_directory(path, root)
+
+    def cleanup_temporary(self, *, startup: bool = False) -> None:
         cutoff = (
             time.time()
             - max(
@@ -431,7 +498,11 @@ class CacheManager:
         )
         for path in self.settings.tmp_dir.iterdir():
             try:
-                if path not in self._staging and path.is_dir() and path.stat().st_mtime < cutoff:
+                if (
+                    path not in self._staging
+                    and path.is_dir()
+                    and (startup or path.stat().st_mtime < cutoff)
+                ):
                     self._remove_directory(path, self.settings.tmp_dir, count=False)
             except FileNotFoundError:
                 continue

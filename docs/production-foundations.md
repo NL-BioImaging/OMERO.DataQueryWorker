@@ -8,7 +8,7 @@ The frozen worker source is commit `2115594`; the frozen Analysis broker is from
 
 Tested engines: DuckDB 1.5.5, sqlglot 28.10.1, SQLite 3.45.3 (Windows) and 3.46.1 (Linux container). The retained local worker 0.1.0 image also contains DuckDB 1.5.5/sqlglot 28.10.1/SQLite 3.46.1. SQLite3 is a filename alias for SQLite. The existing browser runtime uses DuckDB 1.5.1. Supported files are standalone databases readable by the selected engine and UTF-8 CSV accepted by the existing ingestion rules; external files, extensions, attached databases and executable database features are outside the supported format. Copying an uncheckpointed database without its journal is unsupported. Original source bytes are never rewritten.
 
-Actual engine, parser, worker and policy versions, effective query limits, source/schema digests and typed parameters participate in result identity. Legacy manifests are readable; missing execution provenance causes query recomputation. Old result downloads remain available until expiry/eviction. Rollback can reuse readable sources and recompute results under the previous key; do not downgrade DuckDB separately without testing its file compatibility.
+Actual engine, parser, worker and policy versions, effective query limits, source/schema digests and typed parameters participate in result identity. Legacy manifests are readable; missing execution provenance causes query recomputation. Startup discards legacy entries lacking the digest needed for recovery validation, including converted CSV sources without a converted-database digest. Rollback can reuse readable sources and recompute results under the previous key; do not downgrade DuckDB separately without testing its file compatibility.
 
 ## Resource and trust boundaries
 
@@ -19,6 +19,14 @@ Upload admission happens before multipart parsing. Spools, source copies, CSV co
 Ingestion runs off the async loop and defaults to one simultaneous ingestion; query concurrency remains four. Subprocess limits, cancellation monitoring and `finally` cleanup release pipes, processes, uploads, staging paths and slots. Engine children receive credential-free settings and an allowlisted environment before processing sources or SQL. They still run under the service UID: native-code compromise is contained by the container/host boundaries, not by a separate per-query security identity. Keep secrets and cache inaccessible to other users, worker egress blocked, root filesystem read-only, capabilities dropped, no-new-privileges enabled and cgroup memory/PID limits enforced.
 
 Cache storage contains plaintext scientific data. It is disposable, not an audit store or durable result archive. Persist promoted results and provenance in OMERO. No SQL or parameter values are included in metrics. The Analysis audit records identity, context, hashes, counts, duration and outcome; the full recipe is deliberately stored only in the protected provenance annotation.
+
+Source and result publication now fsyncs the staged files and directories, renames the entry, then fsyncs both parents before returning. On restart, a service/engine lock fences surviving work, incomplete staging is removed immediately and committed file checksums/lengths are verified before readiness. Corrupt entries are discarded for recomputation. Linux execution children install a parent-death signal. Each DuckDB query has a private spill directory inside its quota-accounted staging path, preventing concurrent queries from colliding in a source-adjacent spill directory.
+
+## Optional 10M export profile
+
+`deploy/compose.large-export.yaml` raises the row ceiling to 10,000,000, CSV byte limit to 2 GiB, query timeout to 900 seconds and ingestion timeout to 1,800 seconds. Normal defaults remain unchanged. Apply the matching Analysis profile, including its dedicated CSV promotion limit and web/proxy timeouts. The tested two-CPU, 2 GiB, four-query container uses 256 MB per DuckDB engine; four 512 MB engines exceeded the container memory in testing. Wide results must still fit the byte/time/storage limits or fail explicitly.
+
+The coordinated Analysis [large-export/recovery runbook](https://github.com/NL-BioImaging/OMERO.Analysis/blob/feat/data-query-production-foundations/docs/data-query-large-export-recovery.md) provides reproducible 1M/4M/10M fixtures, real HTTP capacity tests, exact 10M/2-GiB boundary checks, real DuckDB/SQLite/CSV OOM, whole-worker OOM, active-query restart and isolated Hyper-V power-cut gates. Real OMERO saved the same verified 609,383,573-byte 10M CSV for all three formats. Analysis journals and an explicit administrator command reconcile interrupted promotions; the worker remains read-only and OMERO-agnostic.
 
 ## Operator controls
 

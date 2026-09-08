@@ -26,6 +26,20 @@ def test_capabilities(client: TestClient, auth: dict[str, str]) -> None:
     assert response.json()["csv_table"] == "data"
 
 
+def test_invalid_upload_metadata_is_a_client_error(client, auth):
+    response = upload_source(
+        client,
+        auth,
+        source_ref="invalid:reference",
+        source_format="csv",
+        filename="source.csv",
+        content=b"id\n1\n",
+    )
+    assert response.status_code == 422
+    assert response.json()["code"] == "invalid_source"
+    assert client.get("/health/ready").status_code == 200
+
+
 def test_duckdb_ingest_schema_query_cache_and_download(
     client: TestClient,
     auth: dict[str, str],

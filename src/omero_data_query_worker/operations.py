@@ -8,12 +8,13 @@ import os
 import re
 import secrets
 import threading
+import time
 import uuid
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from .config import Settings
 from .errors import AuthenticationError
@@ -74,6 +75,50 @@ def sanitize_execution_environment() -> None:
     for name in list(os.environ):
         if name.upper() not in allowed:
             del os.environ[name]
+
+
+def execution_guard(parent_pid: int, directory: Path) -> BinaryIO | None:
+    """Kill Linux engines with their service; fence startup against surviving children."""
+    import sys
+
+    if sys.platform != "linux":
+        return None
+    ctypes = importlib.import_module("ctypes")
+    signal = importlib.import_module("signal")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "Cannot install engine parent-death guard")
+    if os.getppid() != parent_pid:
+        os._exit(125)
+    directory.mkdir(parents=True, exist_ok=True)
+    handle = (directory / ".engines.lock").open("a+b")
+    locking = importlib.import_module("fcntl")
+    locking.flock(handle.fileno(), locking.LOCK_SH)
+    return handle
+
+
+@contextmanager
+def recovery_lock(directory: Path) -> Iterator[None]:
+    if os.name != "posix":
+        yield
+        return
+    locking = importlib.import_module("fcntl")
+    with (directory / ".engines.lock").open("a+b") as handle:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                locking.flock(handle.fileno(), locking.LOCK_EX | locking.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "Previous engines still own this cache; retry startup"
+                    ) from None
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            locking.flock(handle.fileno(), locking.LOCK_UN)
 
 
 @contextmanager

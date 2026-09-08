@@ -342,7 +342,14 @@ def execute_duckdb_query(
     settings: Settings,
 ) -> dict[str, Any]:
     try:
-        connection = duckdb.connect(str(source_path), read_only=True)
+        # DuckDB's default spill path is derived from the shared source filename.
+        # Independent read-only processes must never share spill files. Keeping
+        # spill inside this query's staging directory also makes it quota-accounted.
+        connection = duckdb.connect(
+            str(source_path),
+            read_only=True,
+            config={"temp_directory": str(output_path.parent / "duckdb-spill")},
+        )
         configure_duckdb(connection, settings)
         cursor = connection.execute(sql, parameters)
         return _write_result(

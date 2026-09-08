@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 import time
 from collections.abc import Callable
 from multiprocessing.connection import Connection
@@ -12,7 +13,7 @@ from .engines import convert_csv, inspect_source
 from .errors import IngestionTimedOut, InvalidSource, WorkerError
 from .executor import apply_process_limits, stop_process
 from .models import SourceFormat
-from .operations import sanitize_execution_environment
+from .operations import execution_guard, sanitize_execution_environment
 
 
 def _child_ingest(
@@ -20,8 +21,11 @@ def _child_ingest(
     raw_path: str,
     source_format: str,
     settings: Settings,
+    parent_pid: int,
 ) -> None:
+    guard = None
     try:
+        guard = execution_guard(parent_pid, settings.cache_dir)
         sanitize_execution_environment()
         apply_process_limits(settings, settings.ingestion_timeout_seconds)
         raw = Path(raw_path)
@@ -46,6 +50,8 @@ def _child_ingest(
         child.send({"ok": False, "message": str(exc)})
     finally:
         child.close()
+        if guard:
+            guard.close()
 
 
 def ingest_in_subprocess(
@@ -59,7 +65,13 @@ def ingest_in_subprocess(
     parent, child = context.Pipe(duplex=False)
     process = context.Process(
         target=_child_ingest,
-        args=(child, str(raw_path), source_format.value, settings.execution_settings()),
+        args=(
+            child,
+            str(raw_path),
+            source_format.value,
+            settings.execution_settings(),
+            os.getpid(),
+        ),
         daemon=True,
     )
     try:
