@@ -59,7 +59,8 @@ def test_incomplete_atomic_entry_is_cleaned(settings: Settings) -> None:
 
 
 def test_source_cache_evicts_least_recently_used(settings: Settings) -> None:
-    limited = replace(settings, source_cache_max_bytes=1000)
+    # Each entry includes ~500 bytes of manifest as well as 700 bytes of data.
+    limited = replace(settings, source_cache_max_bytes=1500)
     limited.prepare()
     cache = CacheManager(limited)
 

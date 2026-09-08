@@ -41,6 +41,7 @@ jobs:
           cache: pip
       - run: python -m pip install -e '.[test]'
       - run: python scripts/smoke_container.py
+      - run: python scripts/security_container.py
 
   image-security:
     runs-on: ubuntu-latest

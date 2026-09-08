@@ -79,6 +79,10 @@ the separate `/tmp` tmpfs can therefore remain small and constrained.
 
 ## Verification
 
+See [the coordinated production foundations guide](docs/production-foundations.md)
+for compatibility fixtures, leases and quota behavior, token rotation, mTLS,
+administrative purge, joint testing and rollback.
+
 ```bash
 pytest
 ruff check .

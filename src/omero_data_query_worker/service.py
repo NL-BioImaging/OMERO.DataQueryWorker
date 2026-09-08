@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import threading
+import time as clock
 import uuid
+import weakref
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -15,11 +18,12 @@ from fastapi import UploadFile
 from . import __version__
 from .cache import CacheManager, ResultRecord, SourceRecord, iso, utc_now
 from .config import Settings
-from .engines import validate_filename
+from .engines import engine_versions, validate_filename
 from .errors import (
     InvalidQuery,
     InvalidSource,
     QueryCapacityExceeded,
+    QueryExecutionError,
     SourceConflict,
     SourceNotFound,
     SourceTooLarge,
@@ -37,6 +41,7 @@ from .models import (
     SourceSummary,
     TypedParameter,
 )
+from .operations import Metrics
 from .policy import POLICY_VERSION, ValidatedQuery, validate_query
 
 
@@ -45,8 +50,15 @@ class QueryService:
         self.settings = settings
         self.cache = CacheManager(settings)
         self._query_capacity = threading.BoundedSemaphore(settings.max_concurrent_queries)
-        self._source_locks: dict[str, threading.Lock] = {}
-        self._query_locks: dict[str, threading.Lock] = {}
+        self._source_locks: weakref.WeakValueDictionary[str, threading.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+        self._query_locks: weakref.WeakValueDictionary[str, threading.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+        self._ingest_capacity = threading.BoundedSemaphore(settings.max_concurrent_ingestions)
+        self.stopping = threading.Event()
+        self.metrics = Metrics()
         self._locks_guard = threading.Lock()
 
     def prepare(self) -> None:
@@ -55,7 +67,9 @@ class QueryService:
         self.cache.cleanup_sources()
         self.cache.cleanup_results()
 
-    def _named_lock(self, collection: dict[str, threading.Lock], key: str) -> threading.Lock:
+    def _named_lock(
+        self, collection: weakref.WeakValueDictionary[str, threading.Lock], key: str
+    ) -> threading.Lock:
         with self._locks_guard:
             return collection.setdefault(key, threading.Lock())
 
@@ -84,7 +98,7 @@ class QueryService:
             return SourceResolveResponse(cached=False)
         return SourceResolveResponse(cached=True, source=self._summary(record, "reused"))
 
-    async def ingest_source(
+    def ingest_source(
         self,
         *,
         scope_id: str,
@@ -93,6 +107,35 @@ class QueryService:
         declared_size: int,
         expected_sha256: str | None,
         upload: UploadFile,
+        cancelled: threading.Event | None = None,
+    ) -> SourceSummary:
+        started = clock.monotonic()
+        try:
+            with self._admit(self._ingest_capacity, "ingestion"):
+                return self._ingest_source(
+                    scope_id=scope_id,
+                    source_ref=source_ref,
+                    source_format=source_format,
+                    declared_size=declared_size,
+                    expected_sha256=expected_sha256,
+                    upload=upload,
+                    cancelled=cancelled,
+                )
+        finally:
+            upload.file.close()
+            self.metrics.add("ingestion_requests_total")
+            self.metrics.add("ingestion_duration_seconds_sum", clock.monotonic() - started)
+
+    def _ingest_source(
+        self,
+        *,
+        scope_id: str,
+        source_ref: str,
+        source_format: SourceFormat,
+        declared_size: int,
+        expected_sha256: str | None,
+        upload: UploadFile,
+        cancelled: threading.Event | None = None,
     ) -> SourceSummary:
         source_request = SourceResolveRequest(
             scope_id=scope_id,
@@ -104,7 +147,7 @@ class QueryService:
         filename = validate_filename(upload.filename or "", source_format)
         source_id = self.cache.source_id(scope_id, source_ref)
         lock = self._named_lock(self._source_locks, source_id)
-        with lock:
+        with self._try_lock(lock):
             try:
                 existing = self.cache.get_source(source_id)
             except SourceNotFound:
@@ -124,6 +167,8 @@ class QueryService:
                 )
             staging = self.cache.staging_path("source")
             try:
+                self._monitor(staging, cancelled)
+                self.cache.reserve(staging, declared_size)
                 suffix = {
                     SourceFormat.duckdb: ".duckdb",
                     SourceFormat.sqlite: ".sqlite",
@@ -133,12 +178,14 @@ class QueryService:
                 digest = hashlib.sha256()
                 actual_size = 0
                 with raw_path.open("wb") as output:
-                    while chunk := await upload.read(1024 * 1024):
+                    while chunk := upload.file.read(1024 * 1024):
+                        self._check_cancelled(cancelled)
                         actual_size += len(chunk)
                         if actual_size > self.settings.max_source_bytes:
                             raise SourceTooLarge(
                                 f"Source exceeds the {self.settings.max_source_bytes} byte limit"
                             )
+                        self.cache.reserve(staging, actual_size)
                         digest.update(chunk)
                         output.write(chunk)
                     output.flush()
@@ -151,7 +198,11 @@ class QueryService:
                     raise InvalidSource("Uploaded content does not match expected_sha256")
 
                 data_path, schema, schema_digest = ingest_in_subprocess(
-                    raw_path, source_format, self.settings
+                    raw_path,
+                    source_format,
+                    self.settings,
+                    monitor=lambda: self._monitor(staging, cancelled),
+                    on_exit=lambda code: self._process_exit("ingestion", code),
                 )
                 now = utc_now()
                 from datetime import timedelta
@@ -173,12 +224,8 @@ class QueryService:
                 )
                 committed = self.cache.commit_source(staging, record)
                 return self._summary(committed, "created")
-            except BaseException:
-                if staging.exists():
-                    shutil.rmtree(staging)
-                raise
             finally:
-                await upload.close()
+                self.cache.discard_staging(staging)
 
     def schema(self, source_id: str) -> SchemaResponse:
         record = self.cache.get_source(source_id)
@@ -253,6 +300,10 @@ class QueryService:
             "parameters": parameters,
             "worker_version": __version__,
             "policy_version": POLICY_VERSION,
+            "engines": engine_versions(),
+            "timeout": self.settings.query_timeout_seconds,
+            "memory": self.settings.duckdb_memory_limit,
+            "threads": self.settings.duckdb_threads,
             "max_rows": self.settings.max_result_rows,
             "max_bytes": self.settings.max_result_bytes,
         }
@@ -271,10 +322,27 @@ class QueryService:
             sql_sha256=record.sql_sha256,
             duration_ms=record.duration_ms,
             cache_status=cache_status,  # type: ignore[arg-type]
+            execution=record.execution,
         )
 
-    def query(self, source_id: str, request: QueryRequest) -> QueryResponse:
-        source = self.cache.get_source(source_id)
+    def query(
+        self, source_id: str, request: QueryRequest, cancelled: threading.Event | None = None
+    ) -> QueryResponse:
+        started = clock.monotonic()
+        try:
+            with self.cache.lease_source(source_id) as source:
+                return self._query(source, request, cancelled)
+        except BaseException:
+            self.metrics.add("query_failures_total")
+            raise
+        finally:
+            self.metrics.add("query_requests_total")
+            self.metrics.add("query_duration_seconds_sum", clock.monotonic() - started)
+
+    def _query(
+        self, source: SourceRecord, request: QueryRequest, cancelled: threading.Event | None
+    ) -> QueryResponse:
+        self._check_cancelled(cancelled)
         validated = validate_query(request.sql, source.format, set(request.parameters))
         converted_parameters = {
             name: self._convert_parameter(parameter)
@@ -293,7 +361,7 @@ class QueryService:
             }
         query_key = self._query_key(source, validated, request)
         if validated.deterministic:
-            cached = self.cache.get_result_by_query_key(query_key)
+            cached = self.cache.get_result_by_query_key(query_key, require_provenance=True)
             if cached is not None:
                 self.cache.hits += 1
                 return self._response(cached, "hit")
@@ -302,9 +370,9 @@ class QueryService:
             self.cache.bypasses += 1
             query_lock = threading.Lock()
 
-        with query_lock:
+        with self._try_lock(query_lock):
             if validated.deterministic:
-                cached = self.cache.get_result_by_query_key(query_key)
+                cached = self.cache.get_result_by_query_key(query_key, require_provenance=True)
                 if cached is not None:
                     self.cache.hits += 1
                     return self._response(cached, "hit")
@@ -317,50 +385,129 @@ class QueryService:
                 result_id = f"res_{uuid.uuid4().hex}"
                 stored_query_key = None
 
-            if not self._query_capacity.acquire(blocking=False):
-                raise QueryCapacityExceeded("All disposable query slots are busy")
-            self.cache.active_queries += 1
-            staging = self.cache.staging_path("result")
-            try:
-                source_path = self.cache.source_path(source.source_id) / source.data_file
-                output_path = staging / "result.csv"
-                executed = execute_in_subprocess(
-                    source_path,
-                    source.format,
-                    validated.original_sql,
+            with self._admit(self._query_capacity, "query"):
+                return self._execute(
+                    source,
+                    validated,
                     converted_parameters,
-                    output_path,
-                    self.settings,
+                    result_id,
+                    stored_query_key,
+                    cache_status,
+                    cancelled,
                 )
-                now = utc_now()
-                from datetime import timedelta
 
-                record = ResultRecord(
-                    result_id=result_id,
-                    query_key=stored_query_key,
-                    source_id=source.source_id,
-                    source_sha256=source.sha256,
-                    sql_sha256=validated.sql_sha256,
-                    columns=executed["columns"],
-                    row_count=int(executed["row_count"]),
-                    byte_count=int(executed["byte_count"]),
-                    preview=executed["preview"],
-                    duration_ms=int(executed["duration_ms"]),
-                    result_file="result.csv",
-                    created_at=iso(now),
-                    accessed_at=iso(now),
-                    expires_at=iso(now + timedelta(seconds=self.settings.result_ttl_seconds)),
-                )
-                committed = self.cache.commit_result(staging, record)
-                return self._response(committed, cache_status)
-            except BaseException:
-                if staging.exists():
-                    shutil.rmtree(staging)
-                raise
-            finally:
-                self.cache.active_queries -= 1
-                self._query_capacity.release()
+    def _execute(
+        self,
+        source: SourceRecord,
+        validated: ValidatedQuery,
+        converted_parameters: dict[str, Any],
+        result_id: str,
+        stored_query_key: str | None,
+        cache_status: str,
+        cancelled: threading.Event | None,
+    ) -> QueryResponse:
+        staging = self.cache.staging_path("result")
+        try:
+            source_path = self.cache.source_path(source.source_id) / source.data_file
+            output_path = staging / "result.csv"
+            executed = execute_in_subprocess(
+                source_path,
+                source.format,
+                validated.original_sql,
+                converted_parameters,
+                output_path,
+                self.settings,
+                monitor=lambda: self._monitor(staging, cancelled),
+                on_exit=lambda code: self._process_exit("query", code),
+            )
+            now = utc_now()
+            from datetime import timedelta
+
+            record = ResultRecord(
+                result_id=result_id,
+                query_key=stored_query_key,
+                source_id=source.source_id,
+                source_sha256=source.sha256,
+                sql_sha256=validated.sql_sha256,
+                columns=executed["columns"],
+                row_count=int(executed["row_count"]),
+                byte_count=int(executed["byte_count"]),
+                preview=executed["preview"],
+                duration_ms=int(executed["duration_ms"]),
+                result_file="result.csv",
+                execution={
+                    "schema": "result_provenance_v1",
+                    "result_sha256": executed["result_sha256"],
+                    "schema_digest": source.schema_digest,
+                    "engine": "sqlite" if source.format is SourceFormat.sqlite else "duckdb",
+                    "versions": {
+                        **engine_versions(),
+                        "worker": __version__,
+                        "policy": POLICY_VERSION,
+                    },
+                    "limits": {
+                        "max_result_rows": self.settings.max_result_rows,
+                        "max_result_bytes": self.settings.max_result_bytes,
+                        "query_timeout_seconds": self.settings.query_timeout_seconds,
+                        "duckdb_memory_limit": self.settings.duckdb_memory_limit,
+                        "duckdb_threads": self.settings.duckdb_threads,
+                    },
+                    "executed_at": iso(now - timedelta(milliseconds=int(executed["duration_ms"]))),
+                    "completed_at": iso(now),
+                },
+                created_at=iso(now),
+                accessed_at=iso(now),
+                expires_at=iso(now + timedelta(seconds=self.settings.result_ttl_seconds)),
+            )
+            committed = self.cache.commit_result(staging, record)
+            return self._response(committed, cache_status)
+        finally:
+            self.cache.discard_staging(staging)
 
     def result_file(self, result_id: str) -> tuple[Path, ResultRecord]:
         record = self.cache.get_result(result_id)
         return self.cache.result_path(result_id) / record.result_file, record
+
+    @contextmanager
+    def _try_lock(self, lock: threading.Lock) -> Iterator[None]:
+        if not lock.acquire(blocking=False):
+            self.metrics.add("admission_rejections_total")
+            raise QueryCapacityExceeded("Identical work is already running; retry later")
+        try:
+            yield
+        finally:
+            lock.release()
+
+    @contextmanager
+    def _admit(self, capacity: threading.BoundedSemaphore, kind: str) -> Iterator[None]:
+        self._check_cancelled(None)
+        if not capacity.acquire(blocking=False):
+            self.metrics.add("admission_rejections_total")
+            raise QueryCapacityExceeded(f"All {kind} slots are busy; retry later")
+        self.metrics.add(f"active_{kind}s", 1)
+        if kind == "query":
+            with self.cache._lock:
+                self.cache.active_queries += 1
+        try:
+            yield
+        finally:
+            if kind == "query":
+                with self.cache._lock:
+                    self.cache.active_queries -= 1
+            self.metrics.add(f"active_{kind}s", -1)
+            capacity.release()
+
+    def _check_cancelled(self, cancelled: threading.Event | None) -> None:
+        if self.stopping.is_set() or (cancelled is not None and cancelled.is_set()):
+            raise QueryExecutionError(
+                "Operation interrupted; client disconnected or worker stopping"
+            )
+
+    def _monitor(self, staging: Path, cancelled: threading.Event | None) -> None:
+        self._check_cancelled(cancelled)
+        self.cache.observe_staging(staging)
+
+    def _process_exit(self, kind: str, code: int | None) -> None:
+        self.metrics.add(f"subprocess_{kind}_exits_total")
+        if code != 0:
+            self.metrics.add(f"subprocess_{kind}_abnormal_exits_total")

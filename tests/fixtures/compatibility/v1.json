@@ -1,0 +1,27 @@
+{
+  "worker_commit": "2115594b39108fb55605e4958e11bebf497ef282",
+  "analysis_commit": "4db7f8b25f5562ed3045fd116309d2b5db3d6440",
+  "worker_protocol": "omero-data-query-worker-v1",
+  "analysis_capability": "omero-data-query-v1",
+  "formats": [
+    "duckdb",
+    "sqlite",
+    "csv"
+  ],
+  "query_fields": [
+    "sql",
+    "parameters"
+  ],
+  "result_fields": [
+    "result_id",
+    "columns",
+    "row_count",
+    "byte_count",
+    "preview",
+    "source_sha256",
+    "sql_sha256",
+    "duration_ms",
+    "cache_status"
+  ],
+  "csv": "id,area\n1,10.5\n2,20.5\n"
+}

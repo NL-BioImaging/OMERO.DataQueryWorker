@@ -4,7 +4,9 @@ import importlib
 import multiprocessing
 import os
 import time
+from collections.abc import Callable
 from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ from .config import Settings
 from .engines import execute_duckdb_query, execute_sqlite_query
 from .errors import QueryExecutionError, QueryLimitExceeded, QueryTimedOut, WorkerError
 from .models import SourceFormat
+from .operations import sanitize_execution_environment
 
 
 def apply_process_limits(settings: Settings, timeout_seconds: int) -> None:
@@ -35,7 +38,7 @@ def _child_execute(
     settings: Settings,
 ) -> None:
     try:
-        os.environ.pop("DQW_API_TOKEN", None)
+        sanitize_execution_environment()
         apply_process_limits(settings, settings.query_timeout_seconds)
         started = time.monotonic()
         if SourceFormat(source_format) is SourceFormat.sqlite:
@@ -63,6 +66,8 @@ def execute_in_subprocess(
     parameters: dict[str, Any],
     output_path: Path,
     settings: Settings,
+    monitor: Callable[[], None] | None = None,
+    on_exit: Callable[[int | None], None] | None = None,
 ) -> dict[str, Any]:
     context = multiprocessing.get_context("spawn")
     parent, child = context.Pipe(duplex=False)
@@ -75,31 +80,32 @@ def execute_in_subprocess(
             sql,
             parameters,
             str(output_path),
-            settings,
+            settings.execution_settings(),
         ),
         daemon=True,
     )
-    process.start()
-    child.close()
     try:
-        if not parent.poll(settings.query_timeout_seconds):
-            process.terminate()
-            process.join(2)
-            if process.is_alive():
-                process.kill()
-                process.join(2)
-            raise QueryTimedOut(
-                f"Query exceeded the {settings.query_timeout_seconds} second timeout"
-            )
+        process.start()
+        child.close()
+        deadline = time.monotonic() + settings.query_timeout_seconds
+        while not parent.poll(0.1):
+            if monitor:
+                monitor()
+            if time.monotonic() >= deadline:
+                raise QueryTimedOut(
+                    f"Query exceeded the {settings.query_timeout_seconds} second timeout"
+                )
         payload = parent.recv()
+        if monitor:
+            monitor()
     except EOFError as exc:
         raise QueryExecutionError("The disposable query process exited unexpectedly") from exc
     finally:
         parent.close()
-        process.join(2)
-        if process.is_alive():
-            process.terminate()
-            process.join(2)
+        child.close()
+        exit_code = stop_process(process)
+        if on_exit:
+            on_exit(exit_code)
     if payload.get("ok"):
         return dict(payload["result"])
     if payload.get("code") == "query_limit_exceeded":
@@ -107,3 +113,18 @@ def execute_in_subprocess(
     if payload.get("code") == "query_timeout":
         raise QueryTimedOut(str(payload.get("message") or "Query timed out"))
     raise QueryExecutionError(str(payload.get("message") or "Query execution failed"))
+
+
+def stop_process(process: BaseProcess) -> int | None:
+    if process.pid is None:
+        return None
+    process.join(0.1)
+    if process.is_alive():
+        process.terminate()
+        process.join(2)
+    if process.is_alive():
+        process.kill()
+        process.join(2)
+    exit_code = process.exitcode
+    process.close()
+    return exit_code

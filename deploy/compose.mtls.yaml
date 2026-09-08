@@ -1,0 +1,24 @@
+# Use with compose.yaml. Neither service publishes a host port.
+services:
+  data-query-worker:
+    environment:
+      DQW_TOKEN_KEYRING_FILE: /run/query-secrets/tokens.json
+    volumes:
+      - ${DQW_SECRETS_DIR:?Set DQW_SECRETS_DIR}:/run/query-secrets:ro
+  query-tls:
+    image: nginxinc/nginx-unprivileged:1.28-alpine
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    volumes:
+      - ./deploy/nginx-mtls.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${DQW_TLS_DIR:?Set DQW_TLS_DIR}:/run/query-tls:ro
+    networks: [worker-private, query-broker]
+    depends_on: [data-query-worker]
+networks:
+  query-broker:
+    internal: true

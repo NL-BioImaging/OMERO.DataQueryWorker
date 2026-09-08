@@ -1,0 +1,8 @@
+ARG WORKER_IMAGE=omero-data-query-worker:smoke
+FROM ${WORKER_IMAGE}
+USER root
+RUN python -m pip install --no-cache-dir 'pytest>=8.4,<10' 'httpx>=0.28,<1'
+COPY tests /app/tests
+COPY scripts/security_inside.py /app/scripts/security_inside.py
+USER 10001:10001
+CMD ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "/app/tests"]
