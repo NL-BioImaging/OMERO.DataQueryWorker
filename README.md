@@ -94,6 +94,21 @@ The smoke test builds the container, queries fixtures for all three formats,
 checks result caching and unsafe-SQL rejection, restarts the service, and
 confirms that its cache survives.
 
+## Releases
+
+Update both `pyproject.toml` and `src/omero_data_query_worker/__init__.py` before
+creating a release. Run `python scripts/check_version.py --tag vX.Y.Z`, then
+create an SSH-signed tag using a signer listed in `.github/release-signers`.
+The publication workflow checks both versions and the tag signature before
+publishing the multi-platform container to GHCR with SBOM and provenance
+attestations. CI keeps its separate SPDX SBOM as a workflow artifact and does
+not modify GitHub releases.
+
+Version 0.2.1 accidentally tagged the unchanged 0.2.0 source and did not publish
+a container. Version 0.2.2 corrects the release metadata and CI artifact handling;
+it does not change the worker API or query behavior. Existing published tags
+are preserved rather than moved to different commits.
+
 ## License
 
 Copyright NL-BioImaging contributors. Licensed under

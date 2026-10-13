@@ -20,6 +20,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+      - name: Check package and runtime versions
+        run: python scripts/check_version.py
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[test]'
       - run: python -m pytest --cov=omero_data_query_worker --cov-report=term-missing
@@ -67,3 +69,5 @@ jobs:
           image: omero-data-query-worker:ci
           artifact-name: omero-data-query-worker.spdx.json
           output-file: omero-data-query-worker.spdx.json
+          # CI has read-only contents permission; keep the SBOM as a run artifact.
+          upload-release-assets: false

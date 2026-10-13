@@ -24,9 +24,7 @@ jobs:
           python-version: "3.12"
       - name: Require tag to match package version
         shell: bash
-        run: |
-          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          test "${GITHUB_REF_NAME}" = "v${version}"
+        run: python scripts/check_version.py --tag "${GITHUB_REF_NAME}"
       - name: Verify SSH-signed release tag
         run: |
           git config gpg.format ssh
