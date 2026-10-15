@@ -96,13 +96,34 @@ confirms that its cache survives.
 
 ## Releases
 
+The published container is
+[`cellularimagingcf/omero-data-query-worker`](https://hub.docker.com/r/cellularimagingcf/omero-data-query-worker)
+on Docker Hub. For example:
+
+```console
+docker pull cellularimagingcf/omero-data-query-worker:0.2.2
+```
+
 Update both `pyproject.toml` and `src/omero_data_query_worker/__init__.py` before
 creating a release. Run `python scripts/check_version.py --tag vX.Y.Z`, then
 create an SSH-signed tag using a signer listed in `.github/release-signers`.
 The publication workflow checks both versions and the tag signature before
-publishing the multi-platform container to GHCR with SBOM and provenance
+publishing the multi-platform container to Docker Hub with SBOM and provenance
 attestations. CI keeps its separate SPDX SBOM as a workflow artifact and does
 not modify GitHub releases.
+
+Configure repository Actions secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`
+for the `cellularimagingcf` namespace. Publication no longer uses GHCR or
+`GITHUB_TOKEN` as the container-registry credential.
+
+The initial workflow selected GHCR on 10 August 2026. Version 0.2.2 is copied
+unchanged to Docker Hub by the manually dispatched
+`migrate-0.2.2-to-dockerhub.yml` workflow: it preserves the complete OCI index,
+amd64/arm64 images and embedded attestations, and refuses to replace a different
+existing target tag. Its index digest is
+`sha256:96620294ab7be707952cc94184a70bea86220c2ca257db7e14d489741bfc8c1b`.
+The historical GHCR copy remains available to avoid breaking existing installs.
+Future signed release tags publish directly to Docker Hub.
 
 Version 0.2.1 accidentally tagged the unchanged 0.2.0 source and did not publish
 a container. Version 0.2.2 corrects the release metadata and CI artifact handling;
